@@ -1,0 +1,1 @@
+{"name":"mapomo-starter","private":true,"type":"module","scripts":{"start":"node server.mjs","me":"node examples/me.mjs"},"engines":{"node":">=20"}}

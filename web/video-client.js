@@ -1,0 +1,21 @@
+const MAX_SIZE=250*1024*1024,PART=5*1024*1024;
+const sha=async bytes=>[...new Uint8Array(await crypto.subtle.digest('SHA-256',bytes))].map(x=>x.toString(16).padStart(2,'0')).join('');
+function once(target,event,timeout=30000){return new Promise((resolve,reject)=>{let timer;const cleanup=()=>{clearTimeout(timer);target.removeEventListener(event,ok);target.removeEventListener('error',fail)};const ok=()=>{cleanup();resolve()};const fail=()=>{cleanup();reject(Error('Video cannot be decoded on this device. Try MP4/H.264 or use the desktop preparation tool.'))};timer=setTimeout(fail,timeout);target.addEventListener(event,ok,{once:true});target.addEventListener('error',fail,{once:true})})}
+export async function prepareVideo(file,customTimes=''){
+ if(file.size>MAX_SIZE)throw Error('Video exceeds 250 MB; select a shorter clip or use desktop preparation');const url=URL.createObjectURL(file),video=document.createElement('video');video.muted=true;video.playsInline=true;video.preload='auto';
+ try{const loaded=once(video,'loadedmetadata');video.src=url;video.load();await loaded;const duration=video.duration;if(!Number.isFinite(duration)||duration<=0||duration>1800)throw Error('Use a clip no longer than 30 minutes');
+ const times=customTimes.trim()?customTimes.split(',').map(x=>Number(x.trim())):Array.from({length:8},(_,i)=>Number(((duration-.05)*(i+.5)/8).toFixed(3)));
+ if(times.length>12||times.some(t=>!Number.isFinite(t)||t<0||t>=duration)||new Set(times).size!==times.length)throw Error('Choose 1–12 distinct timestamps inside the video');times.sort((a,b)=>a-b);
+ const canvas=document.createElement('canvas'),scale=Math.min(1,1280/Math.max(video.videoWidth,video.videoHeight));canvas.width=Math.round(video.videoWidth*scale);canvas.height=Math.round(video.videoHeight*scale);const ctx=canvas.getContext('2d');const frames=[];
+ for(const seconds of times){const seek=once(video,'seeked');video.currentTime=seconds===0?.001:seconds;await seek;ctx.drawImage(video,0,0,canvas.width,canvas.height);const blob=await new Promise(r=>canvas.toBlob(r,'image/jpeg',.82));if(!blob)throw Error('Frame extraction failed');frames.push({seconds,width:canvas.width,height:canvas.height,file:new File([blob],`frame-${seconds.toFixed(3)}.jpg`,{type:'image/jpeg'})})}
+ return {duration,frames,sampling:customTimes.trim()?'user-selected timestamps':'8 evenly spaced samples; not complete scene coverage'};
+ }finally{video.removeAttribute('src');video.load();URL.revokeObjectURL(url)}}
+export async function uploadVideo(file,prepared,data,{api,upload,notice}){
+ const head=await sha(await file.slice(0,65536).arrayBuffer()),tail=await sha(await file.slice(-65536).arrayBuffer());const key='mapomo-video-draft:'+JSON.stringify([data.country,data.synthetic,file.name,file.size,head,tail]);let receipt;try{receipt=JSON.parse(sessionStorage.getItem(key)||'null')}catch{}
+ if(!receipt){receipt=await api('video/start',{...data,name:file.name,size:file.size,mime:file.type||(/\.webm$/i.test(file.name)?'video/webm':'video/mp4'),duration:prepared.duration});sessionStorage.setItem(key,JSON.stringify(receipt))}
+ const status=await api('video/status/'+receipt.id);const existing=new Map(status.chunks.map(c=>[c.index,c]));
+ for(let offset=0,index=0;offset<file.size;offset+=PART,index++){const blob=file.slice(offset,Math.min(file.size,offset+PART));const checksum=await sha(await blob.arrayBuffer());notice(`Saving original video: ${Math.round(offset/file.size*100)}%`);if(existing.has(index)){if(existing.get(index).sha256!==checksum)throw Error('Selected video differs from the pending upload; select the original or clear the draft');continue}
+  const r=await fetch('/field-api/video/chunk/'+receipt.id+'/'+index,{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:blob});const result=await r.json();if(!r.ok)throw Error(result.error||'Upload interrupted. Keep the file and retry; saved parts will be reused.');if(result.sha256!==checksum)throw Error('Uploaded video checksum mismatch')}
+ const original=await api('video/finish',{id:receipt.id});const frames=[];for(const f of prepared.frames){const ids=await upload([f.file],data);frames.push({photo_id:ids[0],seconds:f.seconds,width:f.width,height:f.height})}
+ return {video_ref:original.id,frames,photo_ids:frames.map(f=>f.photo_id),sampling:prepared.sampling};
+}
